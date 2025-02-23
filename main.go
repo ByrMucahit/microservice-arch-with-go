@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"microserviceArchWithGo/pkg/config"
+	_ "microserviceArchWithGo/pkg/log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,22 +19,26 @@ import (
 
 func main() {
 	appConfig := config.Read()
-	logger := createLogger()
-	zap.ReplaceGlobals(logger)
-	defer logger.Sync()
+	defer zap.L().Sync()
 
 	zap.L().Info("app starting...")
 
-	app := fiber.New()
+	app := fiber.New(fiber.Config{
+		IdleTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+		Concurrency:  256 * 1024,
+	})
+
+	app.Get("/healthcheck", func(c *fiber.Ctx) error {
+		return c.SendString("OK")
+	})
 
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Hello, World!")
 	})
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGKILL)
 
 	go func() {
 		if err := app.Listen(fmt.Sprintf(":%s", appConfig.Port)); err != nil {
@@ -41,6 +48,12 @@ func main() {
 	}()
 	zap.L().Info("Server started on port ", zap.String("port", appConfig.Port))
 
+	gracefulShutdown(app)
+}
+
+func gracefulShutdown(app *fiber.App) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM, syscall.SIGKILL)
 	<-sigChan
 	zap.L().Info("Shutting down server...")
 
@@ -50,29 +63,31 @@ func main() {
 	zap.L().Info("Server gracefully stopped")
 }
 
-func createLogger() *zap.Logger {
-	encoderCfg := zap.NewProductionEncoderConfig()
-	encoderCfg.TimeKey = "timestamp"
-	encoderCfg.EncodeTime = zapcore.ISO8601TimeEncoder
-
-	config := zap.Config{
-		Level:             zap.NewAtomicLevelAt(zap.InfoLevel),
-		Development:       false,
-		DisableCaller:     false,
-		DisableStacktrace: false,
-		Sampling:          nil,
-		Encoding:          "json",
-		EncoderConfig:     encoderCfg,
-		OutputPaths: []string{
-			"stderr",
-		},
-		ErrorOutputPaths: []string{
-			"stderr",
-		},
-		InitialFields: map[string]interface{}{
-			"pid": os.Getpid(),
+func https() {
+	httpClient := &http.Client{
+		Transport: &http.Transport{
+			Dial: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).Dial,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
 		},
 	}
 
-	return zap.Must(config.Build())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.google.com", nil)
+	if err != nil {
+		zap.L().Error("Failed to create request", zap.Error(err))
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		zap.L().Error("Failed to get google", zap.Error(err))
+	}
+	zap.L().Info("google response", zap.Int("status", resp.StatusCode))
+
 }
