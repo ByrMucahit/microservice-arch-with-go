@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
+	"microserviceArchWithGo/app/healthcheck"
+	"microserviceArchWithGo/app/product"
 	"microserviceArchWithGo/pkg/config"
 	_ "microserviceArchWithGo/pkg/log"
 	"net"
@@ -17,11 +20,54 @@ import (
 	"time"
 )
 
+type Request any
+type Response any
+
+type HandlerInterface[R Request, Res Response] interface {
+	Handle(ctx context.Context, req *R) (*Res, error)
+}
+
+func handle[R Request, Res Response](handler HandlerInterface[R, Res]) fiber.Handler {
+	return func(ctx *fiber.Ctx) error {
+		var req R
+
+		if err := ctx.BodyParser(&req); err != nil && !errors.Is(err, fiber.ErrUnprocessableEntity) {
+			return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		if err := ctx.ParamsParser(&req); err != nil {
+			return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		if err := ctx.QueryParser(&req); err != nil {
+			return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		if err := ctx.ReqHeaderParser(&req); err != nil {
+			return ctx.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		c := ctx.UserContext()
+
+		res, err := handler.Handle(c, &req)
+
+		if err != nil {
+			zap.L().Error("Failed to handle request", zap.Error(err))
+			return ctx.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": err.Error()})
+		}
+
+		return ctx.JSON(res)
+	}
+}
+
 func main() {
 	appConfig := config.Read()
 	defer zap.L().Sync()
 
 	zap.L().Info("app starting...")
+
+	//getProductHandler := product.NewGetProductHandler(couchBaseRepository, retryClient, appConfig.CouchbaseUsername, appConfig.CouchbasePassword)
+	healthCheckHandler := healthcheck.NewHealthCheckHandler()
 
 	app := fiber.New(fiber.Config{
 		IdleTimeout:  5 * time.Second,
@@ -30,11 +76,10 @@ func main() {
 		Concurrency:  256 * 1024,
 	})
 
-	app.Get("/healthcheck", func(c *fiber.Ctx) error {
-		return c.SendString("OK")
-	})
-
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
+	app.Get("/healthcheck", handle[healthcheck.HealthCheckRequest, healthcheck.HealthCheckResponse](healthCheckHandler))
+
+	app.Get("/products/:id", handle[product.GetProductRequest, product.GetProductResponse](g))
 
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Hello, World!")
