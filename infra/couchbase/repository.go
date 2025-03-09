@@ -5,7 +5,7 @@ import (
 	"errors"
 	gocbopentelemetry "github.com/couchbase/gocb-opentelemetry"
 	"github.com/couchbase/gocb/v2"
-	sdktrace "go.opentelemetry.io/otel/trace"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.uber.org/zap"
 	"microserviceArchWithGo/domain"
 	"time"
@@ -67,5 +67,39 @@ func (r *CouchBaseRepository) GetProduct(ctx context.Context, id string) (*domai
 	}
 
 	var product domain.Product
+	if err := data.Content(&product); err != nil {
+		zap.L().Error("Failed to unmarshal product", zap.Error(err))
+		return nil, err
+	}
 
+	return &product, nil
+}
+
+func (r *CouchBaseRepository) CreateProduct(ctx context.Context, product *domain.Product) error {
+	_, err := r.bucket.DefaultCollection().Insert(product.ID, product, &gocb.InsertOptions{
+		Timeout: 3 * time.Second,
+		Context: ctx,
+	})
+	if err != nil {
+		zap.L().Error("Failed to create product", zap.Error(err))
+		return err
+	}
+
+	return nil
+}
+
+func (r *CouchBaseRepository) UpdateProduct(ctx context.Context, product *domain.Product) error {
+	ctx, span := r.tracer.Wrapped().Start(ctx, "UpdateProduct")
+	_, err := r.bucket.DefaultCollection().Replace(product.ID, product, &gocb.ReplaceOptions{
+		Timeout:    3 * time.Second,
+		Context:    ctx,
+		ParentSpan: gocbopentelemetry.NewOpenTelemetryRequestSpan(ctx, span),
+	})
+
+	if err != nil {
+		zap.L().Error("Failed to update product", zap.Error(err))
+		return err
+	}
+
+	return nil
 }
