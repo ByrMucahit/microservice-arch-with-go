@@ -5,11 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/log"
 	"github.com/gofiber/fiber/v2/middleware/adaptor"
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp"
+	"go.opentelemetry.io/otel/propagation"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
 	"go.uber.org/zap"
 	"microserviceArchWithGo/app/healthcheck"
 	"microserviceArchWithGo/app/product"
+	"microserviceArchWithGo/infra/couchbase"
 	"microserviceArchWithGo/pkg/config"
 	_ "microserviceArchWithGo/pkg/log"
 	"net"
@@ -65,8 +76,28 @@ func main() {
 	defer zap.L().Sync()
 
 	zap.L().Info("app starting...")
+	zap.L().Info("appConfig", zap.Any("appConfig", appConfig))
 
-	//getProductHandler := product.NewGetProductHandler(couchBaseRepository, retryClient, appConfig.CouchbaseUsername, appConfig.CouchbasePassword)
+	tp := initTracer(appConfig)
+	client := httpc()
+
+	retryClient := retryablehttp.NewClient()
+	retryClient.HTTPClient.Transport = client.Transport
+	retryClient.RetryMax = 0
+	retryClient.RetryWaitMin = 100 * time.Millisecond
+	retryClient.RetryWaitMax = 10 * time.Second
+	retryClient.Backoff = retryablehttp.LinearJitterBackoff
+	retryClient.CheckRetry = func(ctx context.Context, resp *http.Response, err error) (bool, error) {
+		if ctx.Err() != nil {
+			return false, ctx.Err()
+		}
+		return retryablehttp.DefaultRetryPolicy(ctx, resp, err)
+	}
+
+	couchBaseRepository := couchbase.NewCouchbaseRepository(tp, appConfig.CouchbaseUrl, appConfig.CouchbaseUsername, appConfig.CouchbasePassword)
+
+	getProductHandler := product.NewGetProductHandler(couchBaseRepository, retryClient, appConfig.HttpServer)
+	createProductHandler := product.NewCreateProductHandler(couchBaseRepository)
 	healthCheckHandler := healthcheck.NewHealthCheckHandler()
 
 	app := fiber.New(fiber.Config{
@@ -79,8 +110,8 @@ func main() {
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 	app.Get("/healthcheck", handle[healthcheck.HealthCheckRequest, healthcheck.HealthCheckResponse](healthCheckHandler))
 
-	app.Get("/products/:id", handle[product.GetProductRequest, product.GetProductResponse](g))
-
+	app.Get("/products/:id", handle[product.GetProductRequest, product.GetProductResponse](getProductHandler))
+	app.Post("/products", handle[product.CreateProductRequest, product.CreateProductResponse](createProductHandler))
 	app.Get("/", func(c *fiber.Ctx) error {
 		return c.SendString("Hello, World!")
 	})
@@ -135,4 +166,54 @@ func https() {
 	}
 	zap.L().Info("google response", zap.Int("status", resp.StatusCode))
 
+}
+
+func httpc() *http.Client {
+	transport := &http.Transport{
+		Dial: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).Dial,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	httpClient := &http.Client{
+		Transport: otelhttp.NewTransport(transport),
+	}
+
+	return httpClient
+}
+
+func initTracer(appConfig *config.AppConfig) *sdktrace.TracerProvider {
+	headers := map[string]string{
+		"content-type": "application/json",
+	}
+
+	exporter, err := otlptrace.New(
+		context.Background(),
+		otlptracehttp.NewClient(
+			otlptracehttp.WithEndpoint(appConfig.OtelTraceEndpoint),
+			otlptracehttp.WithHeaders(headers),
+			otlptracehttp.WithInsecure(),
+		),
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(
+			resource.NewWithAttributes(
+				semconv.SchemaURL,
+				semconv.ServiceNameKey.String("microservice-go"),
+			)),
+	)
+
+	otel.SetTracerProvider(tp)
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
+	return tp
 }
